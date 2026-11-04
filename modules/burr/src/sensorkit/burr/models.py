@@ -66,3 +66,20 @@ class CollectConfig(CameraSettings):
         return [
             (name, override.with_defaults(shared)) for name, override in self.instruments.items()
         ]
+
+class MeasuredPlateScaleConfig(BaseModel):
+    """Replace the configured pixel scale with the median of SENPAI's live plate solves.
+
+    Only solved frames from the program's assigned controller count, normalized to unbinned
+    pixels. Each solve must fall within `min_ratio`..`max_ratio` of the configured
+    `telescope.ifov_no_binning_arcsec` (bad solves are dropped, not averaged in). Once
+    `min_solves` have been accepted, the median of the most recent `window` replaces the
+    pixel scale in use whenever it differs from it by more than `tolerance` (fractional).
+    """
+
+    enabled: bool = True
+    min_solves: int = Field(default=3, ge=1)
+    window: int = Field(default=50, ge=1)
+    tolerance: float = Field(default=0.05, gt=0)
+    min_ratio: float = Field(default=0.5, gt=0)
+    max_ratio: float = Field(default=2.0, gt=0)

@@ -93,6 +93,10 @@ class SenpaiResult(BaseModel):
     from_sequence: bool = True
 
     exposure_time_seconds: float | None = None
+    # On-sensor binning (FITS XBINNING/YBINNING); `pixel_scale_arcsec` is per
+    # *binned* pixel, so divide by `x_binning` for the unbinned scale.
+    x_binning: int | None = None
+    y_binning: int | None = None
     n_sources: int | None
     median_fwhm_pixels: float | None
     std_fwhm_pixels: float | None

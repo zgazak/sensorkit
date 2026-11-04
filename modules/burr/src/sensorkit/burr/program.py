@@ -30,11 +30,16 @@ from burr.task_source.lunar.manager import LunarBackgroundManager
 from burr.task_source.photometry.manager import PhotometricStandardsManager
 from burr.task_source.protocol import TaskSource
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 import sensorkit.api as sk
 from sensorkit.astro.common import SitePosition
-from sensorkit.burr.models import CollectConfig
+from sensorkit.burr.models import CollectConfig, MeasuredPlateScaleConfig
+from sensorkit.burr.plate_scale import (
+    PlateScaleEstimator,
+    consume_senpai_results,
+    with_telescope,
+)
 from sensorkit.burr.tasks import build_sk_tasks
 
 
@@ -48,6 +53,16 @@ class BurrConfig(BaseModel):
     raw_data_root: Path | None = None
     # Measured optics; burr plans streak rates from the pixel scale (0.5"/px if unset).
     telescope: TelescopeConfig | None = None
+    # Follow SENPAI's live plate solves; `telescope` is the fallback until enough arrive.
+    measured_plate_scale: MeasuredPlateScaleConfig | None = None
+
+    @model_validator(mode="after")
+    def _measured_needs_fallback(self):
+        if self.measured_plate_scale and self.measured_plate_scale.enabled and not self.telescope:
+            raise ValueError(
+                "measured_plate_scale needs `telescope` as its fallback and sanity reference"
+            )
+        return self
 
     async def to_app_config(self, kit: sk.SensorKit):
         self.controller.resolve(kit)
@@ -89,6 +104,7 @@ class BurrProgram:
     sources: dict[str, TaskSource] | None = None
     scheduler: Scheduler | None = None
     _offer_task: asyncio.Task | None = None
+    _plate_scale_task: asyncio.Task | None = None
 
     @sk.on_attach
     async def startup(self):
@@ -144,12 +160,36 @@ class BurrProgram:
             offer_intervals=[(int.begin, int.end) for int in program.get_offers()],
         )
 
+        await self._cleanup_plate_scale_task()
+        measured = self.config.measured_plate_scale
+        if measured and measured.enabled:
+            telescope = self.app_config.hardware.telescope
+            estimator = PlateScaleEstimator(
+                measured,
+                fallback=self.config.telescope,
+                controller=self.app_config.site.name,
+                applied=telescope.ifov_no_binning_arcsec if telescope else None,
+            )
+
+            async def handle(result):
+                if measured_telescope := estimator.add(result):
+                    await self._apply_telescope(measured_telescope, estimator)
+
+            self._plate_scale_task = asyncio.create_task(
+                consume_senpai_results(
+                    program.sensorkit(),
+                    handle,
+                    start_at=self.run.lighting_schedule.schedule_start_utc,
+                )
+            )
+
     @sk.on_disable
     async def disable(self):
         self.run = None
         self.sources = None
         self.scheduler = None
         await self._cleanup_offer_task()
+        await self._cleanup_plate_scale_task()
 
     @sk.task_factory
     async def next_task(self):
@@ -351,6 +391,37 @@ class BurrProgram:
                     is_last_of_request=(i == len(sk_tasks) - 1),
                 )
             )
+
+    async def _apply_telescope(self, telescope: TelescopeConfig, estimator: PlateScaleEstimator):
+        """Swap the measured telescope into burr's (frozen) config for the run and globally."""
+        previous = self.app_config.hardware.telescope
+        config = with_telescope(self.app_config, telescope)
+
+        def apply_sync():
+            if self.run is not None:
+                self.run.update_config(config)
+
+            # FIXME: Burr needs a way of setting config
+            burr.core.config._config_instance = config
+
+        await asyncio.to_thread(apply_sync)
+        self.app_config = config
+
+        logger.info(
+            f"burr plate scale now {telescope.ifov_no_binning_arcsec:.3f}\"/px unbinned "
+            f"(was {previous.ifov_no_binning_arcsec if previous else 0.5:.3f}\"/px; median of "
+            f"{estimator.n_samples} SENPAI solve(s)), field of view "
+            f"{telescope.field_of_view_degree:.2f} deg"
+        )
+
+    async def _cleanup_plate_scale_task(self):
+        if self._plate_scale_task:
+            self._plate_scale_task.cancel()
+
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._plate_scale_task
+
+            self._plate_scale_task = None
 
     async def _cleanup_offer_task(self):
         if self._offer_task:

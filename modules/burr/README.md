@@ -55,6 +55,16 @@ value:
       cam-west:
         filter_name: g
         gain: 200
+  telescope:                           # optics; burr plans streak rates from the
+    ifov_no_binning_arcsec: 11.53      #   unbinned pixel scale (0.5"/px if unset)
+    field_of_view_degree: 16.6
+  measured_plate_scale:                # follow SENPAI's live WCS solves (see below)
+    enabled: true
+    min_solves: 3                      # accepted solves before replacing `telescope`
+    window: 50                         # median over the most recent N accepted solves
+    tolerance: 0.05                    # re-apply when the median moves > 5%
+    min_ratio: 0.5                     # drop solves outside 0.5x-2x of the configured
+    max_ratio: 2.0                     #   `telescope.ifov_no_binning_arcsec`
   runtime:
     output_dir: /path/to/data/processed/burr   # burr run dirs (run_state.json, plots) — not the FITS dir
   plotting:
@@ -142,6 +152,20 @@ Burr tracks exposure adjustment by that value.
 For a configured filter, `FILTER: =Collect.params.filter_name` writes the commanded name.
 Use device telemetry instead if the header needs the measured filter position.
 
+## Measured Plate Scale
+
+With `measured_plate_scale` enabled (it requires `telescope` as the fallback),
+the program consumes the `SenpaiResult`s SENPAI publishes and, for solved
+frames from its assigned controller, takes `pixel_scale_arcsec / x_binning`
+as an unbinned pixel-scale sample. Samples outside the sanity bounds are
+logged and dropped; once `min_solves` are in, their running median replaces
+`telescope.ifov_no_binning_arcsec` (and scales `field_of_view_degree` to
+match) in burr's run config whenever it differs from the scale in use by
+more than `tolerance`. Until then — or through a night of sparse or failed
+solves — burr keeps planning from the configured `telescope`. On enable the
+program replays the results published since the start of the run's
+schedule, so a restart mid-night keeps the solves it has already seen.
+
 ## Processing a Night (SENPAI)
 
 Collection is automated; and while SENPAI (see the `senpai` module) can process frames -- e.g. for WCS, FWHM,
@@ -189,4 +213,6 @@ sensorkit service run burr sensorkit.burr.program
 - **Live night-level processing** — `senpai.cli.burr live` is a stub, and
   analysis results are not yet written back into the run's
   `AnalysisResults` container; today the live tier is per-frame telemetry
-  only, and the combined products require the post-night batch commands.
+  (of which only the plate scale feeds back into planning, see
+  [Measured Plate Scale](#measured-plate-scale)), and the combined products
+  require the post-night batch commands.

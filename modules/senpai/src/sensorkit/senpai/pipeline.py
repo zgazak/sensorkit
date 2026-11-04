@@ -79,6 +79,18 @@ def _iso_z(dt: datetime) -> str:
     return dt.isoformat().replace("+00:00", "Z")
 
 
+def _binning(image) -> tuple[int | None, int | None]:
+    """A frame's (XBINNING, YBINNING), each None when missing/unparseable."""
+
+    def axis(key: str) -> int | None:
+        try:
+            return int(image.header[key])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    return axis("XBINNING"), axis("YBINNING")
+
+
 def _obs_time(image) -> datetime | None:
     """A frame's DATE-OBS as a UTC datetime, or None when it's missing/unparseable."""
     try:
@@ -241,6 +253,7 @@ class SenpaiPipeline:
     ) -> SenpaiResult:
         """Build the SenpaiResult for one frame of the collect run."""
         timestamp = datetime.fromisoformat(image.header["DATE-OBS"]).replace(tzinfo=UTC)
+        x_binning, y_binning = _binning(image)
 
         frame, track_mode = frames_by_path.get(inp.file_path, (None, "UNKNOWN"))
         if frame is None:
@@ -255,6 +268,8 @@ class SenpaiPipeline:
                 frame_count=inp.frame_count,
                 from_sequence=from_sequence,
                 exposure_time_seconds=image.header.get("EXPTIME"),
+                x_binning=x_binning,
+                y_binning=y_binning,
                 n_sources=0,
                 median_fwhm_pixels=None,
                 std_fwhm_pixels=None,
@@ -407,6 +422,8 @@ class SenpaiPipeline:
             frame_count=inp.frame_count,
             from_sequence=from_sequence,
             exposure_time_seconds=exposure,
+            x_binning=x_binning,
+            y_binning=y_binning,
             n_sources=len(detections),
             median_fwhm_pixels=median_fwhm_pixels,
             std_fwhm_pixels=std_fwhm_pixels,

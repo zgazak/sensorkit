@@ -254,6 +254,7 @@ type = "layers"
 ignore_imports = [
     # SenpaiResult
     "sensorkit.udl.publishers -> sensorkit.senpai.models",
+    "sensorkit.burr.plate_scale -> sensorkit.senpai.models",
     # Autoslew devices are specialized Alpaca devices
     "sensorkit.autoslew.** -> sensorkit.alpaca.**",
     # Standard constraints subclass the auto constraint base

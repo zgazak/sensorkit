@@ -236,3 +236,17 @@ class TestProcessFrames:
         )
 
         assert [r.file_path for r in results] == ["a.fits"]
+
+    def test_binning_from_header(self, monkeypatch):
+        images = {"a.fits": make_image(file_path="a.fits", XBINNING=2, YBINNING=3)}
+        [result] = run_pipeline(
+            monkeypatch, [inp("a.fits")], images, sidereal=[make_frame(images["a.fits"])]
+        )
+        assert (result.x_binning, result.y_binning) == (2, 3)
+
+    def test_binning_missing_from_header(self, monkeypatch):
+        images = {"a.fits": make_image(file_path="a.fits")}
+        [result] = run_pipeline(
+            monkeypatch, [inp("a.fits")], images, sidereal=[make_frame(images["a.fits"])]
+        )
+        assert (result.x_binning, result.y_binning) == (None, None)
