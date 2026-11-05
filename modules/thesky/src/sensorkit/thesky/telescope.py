@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+import time
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, override
 
@@ -25,6 +27,7 @@ from sensorkit.astro.target import (
     FrameTarget,
     ICRSTarget,
     RateTarget,
+    TargetTrack,
     TLETarget,
 )
 from sensorkit.common.aio import AsyncLoop
@@ -58,6 +61,13 @@ from sensorkit.thesky.device import (
     TheSkyDeviceState,
     TheSkyError,
 )
+from sensorkit.thesky.follow import (
+    SECONDS_PER_DAY,
+    FollowPath,
+    angular_offset,
+    lead_slew,
+    wrap_degrees,
+)
 
 iers.conf.auto_download = False
 # Suppress the warning that results from the above decision
@@ -68,6 +78,19 @@ LEO_WAITING, LEO_SLEWING, LEO_SETTLING, LEO_TRACKING = 3, 4, 5, 6
 # Max time to wait for a commanded slew to *start* before treating it as a
 # positional no-op.
 _MOUNT_ONSET_TIMEOUT = 2.0
+
+
+@dataclass
+class _Follow:
+    """A path follow in progress: the path and what the mount was last told and seen."""
+
+    path: FollowPath
+    # Commanded offset rates, deg/s of RA and Dec.
+    rate: tuple[float, float] = (0.0, 0.0)
+    # Last mount readback as (ra deg, dec deg, jd); None until one follows a slew.
+    mount: tuple[float, float, float] | None = None
+    # time.monotonic() of the last slew onto the path.
+    slewed_at: float = 0.0
 
 
 def radec_rates_to_altaz_rates(
@@ -136,8 +159,12 @@ class TheSkyTelescope(TheSkyDevice):
 
     # Whether TheSky has the Raven3 satellite-tracking plugin, probed in entity_init.
     # Without it, any reference to Raven3 throws, which parks TheSky's script server
-    # in its debugger, so TLE targets fall back to an ephemeris and rate follow.
+    # in its debugger, so TLE targets follow their propagated track instead (_start_follow).
     _has_raven3: bool = True
+
+    # Re-rates the mount along a moving target's path; see _follow_tick.
+    _follow_loop: AsyncLoop | None = None
+    _follow: _Follow | None = None
 
     # NOTE: For a TheSky telescope, you have to home it before any commands at all, and you have to "Unpark" it
     # (if in the "Park" position) before any motion. If you "Park" the telescope and "Disconnect" it, note that
@@ -206,7 +233,7 @@ class TheSkyTelescope(TheSkyDevice):
 
         self._has_raven3 = (await self.execute("""typeof Raven3;""")).strip() != "undefined"
         if not self._has_raven3:
-            logger.warning("TheSky has no Raven3 plugin; TLE targets will follow a constant-rate ephemeris")
+            logger.warning("TheSky has no Raven3 plugin; TLE targets will follow their propagated track")
 
     @sk.on_detach
     async def entity_deinit(self):
@@ -240,6 +267,7 @@ class TheSkyTelescope(TheSkyDevice):
                 return
 
         await self.fast_loop.stop()
+        await self._stop_follow()
         await self.telescope_stop(Stop())
         await self.telescope_park(MoveToPark())
 
@@ -264,6 +292,7 @@ class TheSkyTelescope(TheSkyDevice):
 
     @sk.command_handler
     async def telescope_disconnect(self, cmd: Disconnect):
+        await self._stop_follow()
         logger.debug("disconnecting from telescope")
 
         await self.execute(
@@ -282,6 +311,7 @@ class TheSkyTelescope(TheSkyDevice):
 
     @sk.command_handler
     async def telescope_stop(self, cmd: Stop):
+        await self._stop_follow()
         await self.fast_loop.stop()
         await self.telescope_unpark()
         logger.debug("stopping telescope")
@@ -304,6 +334,7 @@ class TheSkyTelescope(TheSkyDevice):
 
     @sk.command_handler
     async def telescope_park(self, cmd: MoveToPark):
+        await self._stop_follow()
         await self.fast_loop.stop()
         await self.require_connected()
         logger.debug("parking telescope")
@@ -359,6 +390,7 @@ class TheSkyTelescope(TheSkyDevice):
 
     @sk.command_handler
     async def telescope_home(self, cmd: Home):
+        await self._stop_follow()
         await self.fast_loop.stop()
         await self.telescope_unpark()
         logger.debug("homing telescope")
@@ -418,6 +450,7 @@ class TheSkyTelescope(TheSkyDevice):
         await self._homed_retry(lambda: self._follow_target(cmd))
 
     async def _follow_target(self, cmd: FollowTarget):
+        await self._stop_follow()
         await self.fast_loop.stop()
         await self.telescope_unpark()
 
@@ -432,6 +465,8 @@ class TheSkyTelescope(TheSkyDevice):
             *([TLETarget] if self._has_raven3 else []),
             (RateTarget, ReferenceFrame.ICRF),
             (EphemerisTarget, ReferenceFrame.ICRF),
+            # Satellites Raven3 can't take (or any trajectory) follow an unbounded track.
+            (TargetTrack, ReferenceFrame.ICRF),
             observer=self._geodetic,
         )
 
@@ -581,40 +616,13 @@ class TheSkyTelescope(TheSkyDevice):
 
             case EphemerisTarget():
                 logger.debug("executing Ephemeris follow")
-
-                # TheSky has no path-follow primitive, so collapse the precomputed
-                # path to an initial position plus a constant offset rate: slew to
-                # the sample nearest now and finite-difference the two adjacent
-                # samples for the instantaneous RA/Dec rate. Like the TLE case, this
-                # is a best-effort snapshot that drifts over time.
-                jds = target.jds
-                points = target.points
-                now_jd = Time.now().jd
-                i = min(range(len(jds) - 1), key=lambda j: abs(jds[j] - now_jd))
-
-                dt_sec = (jds[i + 1] - jds[i]) * 86400.0
-                # Wrap the RA difference into [-180, 180] deg to survive 0/360 crossings.
-                dra_deg = (points[i + 1].ra - points[i].ra + 180.0) % 360.0 - 180.0
-                ddec_deg = points[i + 1].dec - points[i].dec
-
-                await self.execute(
-                    f"""
-                    sky6RASCOMTele.SlewToRaDec(
-                        {points[i].ra / 15:0.6f},
-                        {points[i].dec:0.6f},
-                        "object"
-                    );
-                    """
-                )
-
-                # Apply offset rates (degrees/sec -> arcsec/sec), matching RateTarget
-                ra_rate_arcsec = dra_deg / dt_sec * 3600
-                dec_rate_arcsec = ddec_deg / dt_sec * 3600
-                tracked = await self._set_tracking(1, 0, ra_rate_arcsec, dec_rate_arcsec)
-                await self._wait_for_mount(tracking=tracked)
-                self.fast_loop.start()
-
+                await self._start_follow(FollowPath.from_ephemeris(target))
                 logger.debug("following Ephemeris target")
+
+            case TargetTrack():
+                logger.debug("executing track follow")
+                await self._start_follow(await FollowPath.from_track(target))
+                logger.debug("following track")
 
             case FrameTarget():
                 match target.frame:
@@ -691,6 +699,139 @@ class TheSkyTelescope(TheSkyDevice):
                     await asyncio.sleep(0.1)
                 case _:
                     raise RuntimeError(f"Unexpected dome status {status!r}")
+
+    async def _start_follow(self, path: FollowPath):
+        """Follow a moving target along *path*.
+
+        TheSky has no path-follow primitive, only a slew and a constant offset rate. So
+        slew to where the target will be when the slew ends, track at its rate from
+        there, and keep re-rating the mount along the path in the background.
+        """
+        follow = _Follow(path)
+        tracked = await self._follow_slew(follow)
+
+        if tracked:
+            self._follow = follow
+            self._follow_loop = AsyncLoop(
+                self._follow_tick, interval=self.config.follow_update_period, log=True
+            )
+            self._follow_loop.start()
+
+        self.fast_loop.start()
+
+    async def _stop_follow(self):
+        """Stop re-rating the mount, if a path follow is running."""
+        if self._follow_loop is not None:
+            await self._follow_loop.stop()
+            self._follow_loop = None
+        self._follow = None
+
+    async def _follow_slew(self, follow: _Follow) -> bool:
+        """Slew onto the path ahead of the target and track at its rate on arrival.
+
+        Returns whether the offset rates were applied (see _set_tracking).
+        """
+        config = self.config
+        follow.slewed_at = time.monotonic()
+        follow.mount = None
+
+        ra_hr, dec = await self._get_radec()
+        await follow.path.ensure(Time.now().jd)
+        arrival_jd, ra, dec = lead_slew(
+            follow.path,
+            ra_hr * 15,
+            dec,
+            overhead=config.follow_slew_overhead,
+            rate=config.follow_slew_rate,
+        )
+        follow.rate = follow.path.rate(arrival_jd, config.follow_update_period)
+        lead = (arrival_jd - Time.now().jd) * SECONDS_PER_DAY
+
+        await self.execute(
+            f"""
+            sky6RASCOMTele.SlewToRaDec(
+                {ra / 15:0.6f},
+                {dec:0.6f},
+                "object"
+            );
+            """
+        )
+
+        # Offset rates (degrees/sec -> arcsec/sec), matching RateTarget
+        tracked = await self._set_tracking(1, 0, follow.rate[0] * 3600, follow.rate[1] * 3600)
+        await self._wait_for_mount(tracking=tracked)
+
+        # Compare to tune follow_slew_overhead/follow_slew_rate: the slew lands on the
+        # target only as well as the estimate matches.
+        took = time.monotonic() - follow.slewed_at
+        logger.debug(f"follow slew led the target by {lead:.1f} s; the slew took {took:.1f} s")
+
+        return tracked
+
+    async def _follow_tick(self):
+        """Re-rate the mount along the followed path.
+
+        Each tick is one script: it reads the mount's position and sets the new rate,
+        the path's mean rate over the next update period plus a correction that
+        removes `follow_correction_gain` of the pointing error by then. The error
+        comes from the previous tick's readback, carried forward at the rate commanded
+        since. Past `follow_reslew_threshold`, slew back onto the path instead.
+        """
+        follow = self._follow
+        if follow is None:
+            return
+
+        config = self.config
+        period = config.follow_update_period
+        now = Time.now().jd
+
+        await follow.path.ensure(now + period / SECONDS_PER_DAY)
+        ra, dec = follow.path.position(now)
+        ra_rate, dec_rate = follow.path.rate(now, period)
+
+        if follow.mount is not None:
+            mount_ra, mount_dec, mount_jd = follow.mount
+            elapsed = (now - mount_jd) * SECONDS_PER_DAY
+            mount_ra += follow.rate[0] * elapsed
+            mount_dec += follow.rate[1] * elapsed
+
+            error = angular_offset(ra, dec, mount_ra, mount_dec)
+            if error > config.follow_reslew_threshold:
+                if time.monotonic() - follow.slewed_at >= config.follow_reslew_interval:
+                    logger.info(f"follow pointing error {error:.3f} deg; slewing back onto the path")
+                    await self._follow_slew(follow)
+                    return
+                # Too soon to slew again; correct at most a threshold's worth meanwhile.
+                scale = config.follow_reslew_threshold / error
+            else:
+                scale = 1.0
+
+            correction = config.follow_correction_gain * scale / period
+            ra_rate += wrap_degrees(ra - mount_ra) * correction
+            dec_rate += (dec - mount_dec) * correction
+
+        sent = Time.now().jd
+        resp = await self.execute(
+            f"""
+            var Out;
+            if (sky6RASCOMTele.IsConnected) {{
+                sky6RASCOMTele.GetRaDec();
+                Out = [sky6RASCOMTele.dRa, sky6RASCOMTele.dDec];
+                sky6RASCOMTele.SetTracking(1, 0, {ra_rate * 3600:0.6f}, {dec_rate * 3600:0.6f});
+            }} else {{
+                Out = "disconnected";
+            }}
+            """
+        )
+        received = Time.now().jd
+
+        if resp.strip() == "disconnected":
+            follow.mount = None
+            return
+
+        mount_ra_hr, mount_dec = (float(x) for x in resp.split(","))
+        follow.mount = (mount_ra_hr * 15, mount_dec, (sent + received) / 2)
+        follow.rate = (ra_rate, dec_rate)
 
     def write_tle(self, target: TLE) -> str:
         """Write TLE to a temp file and return the path for TheSky use."""
@@ -817,14 +958,7 @@ class TheSkyTelescope(TheSkyDevice):
         returning it even after the dome stops, and TheSky stops slaving the dome
         meanwhile. Sending the same slew again clears it (#55), so do that.
         """
-        resp = await self.execute(
-            """
-            var Out;
-            sky6RASCOMTele.GetRaDec();
-            Out = [sky6RASCOMTele.dRa, sky6RASCOMTele.dDec];
-            """
-        )
-        ra, dec = (float(x) for x in resp.split(","))
+        ra, dec = await self._get_radec()
 
         async with asyncio.timeout(self.config.timeout):
             while True:
@@ -842,6 +976,18 @@ class TheSkyTelescope(TheSkyDevice):
                     # 123 latch (#55): the next pass re-sends the slew to clear it
                     logger.debug("settle latched on TheSky error 123; re-sending slew")
                     await asyncio.sleep(0.1)
+
+    async def _get_radec(self) -> tuple[float, float]:
+        """Return the mount's (RA hours, Dec degrees)."""
+        resp = await self.execute(
+            """
+            var Out;
+            sky6RASCOMTele.GetRaDec();
+            Out = [sky6RASCOMTele.dRa, sky6RASCOMTele.dDec];
+            """
+        )
+        ra, dec = (float(x) for x in resp.split(","))
+        return ra, dec
 
     async def _publish_telescope_status(self):
         try:
@@ -968,6 +1114,19 @@ class TheSkyTelescopeConfig(TheSkyDeviceConfig[TheSkyTelescope]):
     status_frequency_fast: float = 0.1
     timeout: float = 300.0
     require_coupled_dome: bool = False
+
+    # Following a moving target (an ephemeris, or a satellite without Raven3): the slew
+    # leads the target by its estimated duration, overhead + the larger axis move at
+    # follow_slew_rate, then the rate is updated every follow_update_period seconds.
+    follow_slew_overhead: float = 3.0
+    follow_slew_rate: float = 4.0
+    # One script per update (a readback and a SetTracking), on top of the status polls.
+    follow_update_period: float = 2.0
+    # Fraction of the pointing error each update removes by the next one.
+    follow_correction_gain: float = 0.5
+    # Pointing error (degrees) past which to slew back onto the path, at most this often (s).
+    follow_reslew_threshold: float = 0.2
+    follow_reslew_interval: float = 30.0
 
     @override
     def create_device(self):

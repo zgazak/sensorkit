@@ -145,7 +145,20 @@ var ccdsoftCameraImage = {
 //
 var _sky6RASCOMTele = {
     Abort: function () {
+        this._advance();
         this.IsTracking = 0;
+    },
+    // Move the pointing on by the offset rates applied since the last call, so a readback
+    // shows a mount tracking at them. Positions only move here and in SetTracking, which
+    // keeps a script that only reads dRa/dDec seeing what the last slew left.
+    _advance: function () {
+        var now = Date.now();
+        if (this.IsTracking && this._offsetRates && this._ratesSince) {
+            var dt = (now - this._ratesSince) / 1000;
+            this.dRa = ((this.dRa + this.dRaTrackingRate * dt / 3600 / 15) % 24 + 24) % 24;
+            this.dDec = this.dDec + this.dDecTrackingRate * dt / 3600;
+        }
+        this._ratesSince = now;
     },
     ConnectAndDoNotUnpark: function () {
         this.IsConnected = 1;
@@ -157,6 +170,7 @@ var _sky6RASCOMTele = {
         }
     },
     GetRaDec: function () {
+        this._advance();
     },
     GetAzAlt: function () {
     },
@@ -177,7 +191,9 @@ var _sky6RASCOMTele = {
     },
     SetTracking: function (on, b, c, d) {
         if (!this.IsConnected || this.IsParked()) throw false;
+        this._advance();
         this.IsTracking = on;
+        this._offsetRates = b === 0;
         if (b === 0) {
             this.dRaTrackingRate = c;
             this.dDecTrackingRate = d;
@@ -188,6 +204,7 @@ var _sky6RASCOMTele = {
         if (!this.IsConnected || this.IsParked()) throw false;
         this.dRa = ra;
         this.dDec = dec;
+        this._ratesSince = Date.now();
         this.IsTracking = 1;
         this.IsSlewComplete = 1;
         this.LastSlewError = 0;
@@ -218,6 +235,8 @@ var _sky6RASCOMTeleDefaults = {
     dDecTrackingRate: 0.0,
     dRa: 12.0,
     dRaTrackingRate: 0.0,
+    _offsetRates: false,
+    _ratesSince: 0,
 };
 
 // Create the sky6RASCOMTele object, restoring fields from the input state.
