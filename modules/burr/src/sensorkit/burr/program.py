@@ -15,6 +15,7 @@ from burr.core.config import (
     RuntimeConfig,
     ScheduleConfig,
 )
+from burr.models.hardware import HardwareConfig, TelescopeConfig
 from burr.models.observation import ObservationRequest
 from burr.models.run import BurrRun
 from burr.models.site import LightingCondition, SiteMetadata
@@ -45,6 +46,8 @@ class BurrConfig(BaseModel):
     collect: CollectConfig = Field(default_factory=CollectConfig)
     minimum_altitude_degrees: float = 0.0
     raw_data_root: Path | None = None
+    # Measured optics; burr plans streak rates from the pixel scale (0.5"/px if unset).
+    telescope: TelescopeConfig | None = None
 
     async def to_app_config(self, kit: sk.SensorKit):
         self.controller.resolve(kit)
@@ -61,6 +64,7 @@ class BurrConfig(BaseModel):
                 minimum_altitude_degrees=self.minimum_altitude_degrees,
             ),
             schedule=self.schedule,
+            hardware=HardwareConfig(telescope=self.telescope),
         )
 
 
@@ -119,6 +123,13 @@ class BurrProgram:
         # Publish offers.
         async def offer_loop(cadence: float):
             while True:
+                # A run covers one night (local noon to noon); roll over once it ends so a
+                # long-lived enable keeps offering tonight's windows.
+                if datetime.now(UTC) >= self.run.lighting_schedule.schedule_end_utc:
+                    logger.info(f"burr run {self.run.run_id} has ended; starting the next night's run")
+                    self._queue.clear()
+                    await asyncio.to_thread(init_burr_sync)
+
                 for start, end in self._offer_intervals():
                     program.add_offer(start, end)
 
