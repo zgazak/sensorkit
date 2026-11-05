@@ -4,17 +4,18 @@ from __future__ import annotations
 import array
 import asyncio
 import uuid
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Literal, override
 
 import numpy as np
+from astropy.io import fits
 from astropy.time import Time
 from loguru import logger
 
 import sensorkit.api as sk
 from sensorkit.common.aio import AsyncLoop
 from sensorkit.data.filesys import FileNameTemplate
-from sensorkit.data.fits import ArrayInfo, ImageInfo
+from sensorkit.data.fits import ArrayInfo, BayerPattern, ImageInfo
 from sensorkit.std import (
     Binning,
     CameraCapture,
@@ -46,6 +47,10 @@ class TheSkyCamera(TheSkyDevice):
     config: TheSkyCameraConfig
     device_name = "Camera"
 
+    # Set while a capture runs. Status polls skip it: querying the camera mid-capture has hung
+    # TheSky's script server (observed with a Canon DSLR), stalling every other device.
+    _capturing: bool = False
+
     @sk.on_attach
     async def entity_init(self):
         device = sk.device()
@@ -76,7 +81,10 @@ class TheSkyCamera(TheSkyDevice):
         self._reconnect = lambda: self.camera_connect(Connect())
         await self.camera_connect(Connect())
 
-        # Set the camera temperature
+        # Set the camera temperature, unless the camera has no cooler (e.g. a DSLR, whose
+        # TheSky plugin raises on TemperatureSetPoint)
+        if self.config.temperature is None:
+            return
         await self.camera_set_temperature(
             ConfigureCameraCooler(
                 enable=True,
@@ -217,6 +225,13 @@ class TheSkyCamera(TheSkyDevice):
 
     @sk.command_handler
     async def camera_capture(self, cmd: CameraCapture):
+        self._capturing = True
+        try:
+            await self._capture(cmd)
+        finally:
+            self._capturing = False
+
+    async def _capture(self, cmd: CameraCapture):
         await self.require_connected()
         logger.info(f"Requesting {cmd.integration_time:.1f} sec capture from camera")
         logger.debug("starting camera capture")
@@ -228,6 +243,14 @@ class TheSkyCamera(TheSkyDevice):
             FrameType.DARK: 3,
             FrameType.FLAT: 4,
         }[cmd.frame_type]
+
+        # In file readout, TheSky saves the frame itself; remember the previous file so a
+        # stale name is never mistaken for this exposure's.
+        previous_file = None
+        if self.config.readout == "file":
+            previous_file = _image_file_name(await self.execute("""ccdsoftCamera.LastImageFileName;"""))
+            await self.execute("""ccdsoftCamera.AutoSaveOn = 1;""")
+
         await self.execute(
             f"""
             ccdsoftCamera.Frame = {frame_code};
@@ -237,45 +260,22 @@ class TheSkyCamera(TheSkyDevice):
         )
 
         async with asyncio.timeout(cmd.integration_time + self.config.timeout):
-            await self.poll("""ccdsoftCamera.IsExposureComplete;""", "1", interval=0.01)
+            await self.poll("""ccdsoftCamera.IsExposureComplete;""", "1", interval=0.25)
 
-        resp = await self.execute(
-            """
-            ccdsoftCameraImage.AttachToActiveImager();
-            var H = ccdsoftCameraImage.HeightInPixels;
-            var Out = "";
-            for (var y = 0; y < H; y++) {
-                if (y > 0) Out += ";";
-                Out += ccdsoftCameraImage.scanLine(y);
-            }
-            """
-        )
+        if self.config.readout == "file":
+            data, date_obs, temp, binx, biny = await self._read_saved_frame(previous_file)
+        else:
+            data, date_obs, temp, binx, biny = await self._read_scanlines()
 
-        # Convert it to list[array.array] - this is CPU-bound, so background it
-        data: list[array.array] = await asyncio.to_thread(
-            self._pixels_from_csv_block, resp, "uint16"
-        )
-
-        if not data or not data[0]:
+        if data is None or not len(data) or not len(data[0]):
             logger.error("No data returned from camera!")
             return
 
-        array_info = ArrayInfo.from_array(data[0], shape=(len(data), len(data[0])))
+        if isinstance(data, np.ndarray):
+            array_info = ArrayInfo.from_array(data)
+        else:
+            array_info = ArrayInfo.from_array(data[0], shape=(len(data), len(data[0])))
         logger.debug(f"got image array with {len(data)} rows, {len(data[0])} cols, dtype {array_info.dtype}")
-
-        # Build data context
-        resp = await self.execute(
-            """
-            var Out;
-            Out = [
-                ccdsoftCameraImage.JulianDay,
-                ccdsoftCameraImage.Temperature,
-                ccdsoftCamera.BinX,
-                ccdsoftCamera.BinY
-            ];
-            """
-        )
-        jd, temp, binx, biny = [float(x) for x in resp.split(",")]
 
         # Write it to the DataGraph
         if graph := await sk.device().data_graph():
@@ -283,9 +283,9 @@ class TheSkyCamera(TheSkyDevice):
 
             detector = await self.execute("""SelectedHardware.cameraModel;""")
             cmd.context.set(
-                ImageInfo(array=array_info, binning=(int(binx), int(biny))),
+                ImageInfo(array=array_info, bayer=self.config.bayer, binning=(int(binx), int(biny))),
                 ExposureInfo(
-                    date_obs=Time(jd, format="jd", scale="utc").to_datetime(timezone=UTC),
+                    date_obs=date_obs,
                     exposure_time=cmd.integration_time,
                     detector=detector,
                     image_type=cmd.frame_type,
@@ -315,6 +315,64 @@ class TheSkyCamera(TheSkyDevice):
 
         logger.debug("completed camera capture")
 
+    async def _read_scanlines(self):
+        """Pull the active image through TheSky's script server, one CSV scan line at a time."""
+        resp = await self.execute(
+            """
+            ccdsoftCameraImage.AttachToActiveImager();
+            var H = ccdsoftCameraImage.HeightInPixels;
+            var Out = "";
+            for (var y = 0; y < H; y++) {
+                if (y > 0) Out += ";";
+                Out += ccdsoftCameraImage.scanLine(y);
+            }
+            """
+        )
+
+        # Convert it to list[array.array] - this is CPU-bound, so background it
+        data: list[array.array] = await asyncio.to_thread(
+            self._pixels_from_csv_block, resp, "uint16"
+        )
+
+        resp = await self.execute(
+            """
+            var Out;
+            Out = [
+                ccdsoftCameraImage.JulianDay,
+                ccdsoftCameraImage.Temperature,
+                ccdsoftCamera.BinX,
+                ccdsoftCamera.BinY
+            ];
+            """
+        )
+        jd, temp, binx, biny = resp.split(",")
+        date_obs = Time(float(jd), format="jd", scale="utc").to_datetime(timezone=UTC)
+        return data, date_obs, _float_or_none(temp), float(binx), float(biny)
+
+    async def _read_saved_frame(self, previous_file: str | None):
+        """Read the frame TheSky auto-saved, once it reports a file newer than *previous_file*.
+
+        Large frames (e.g. an 18 MP DSLR) never pass through TheSky's script engine this way;
+        building them as one CSV string there has crashed TheSky.
+        """
+        async with asyncio.timeout(self.config.timeout):
+            while True:
+                path = _image_file_name(await self.execute("""ccdsoftCamera.LastImageFileName;"""))
+                if path and path != previous_file:
+                    break
+                await asyncio.sleep(0.2)
+
+        def read():
+            with fits.open(path, memmap=False) as hdul:
+                return np.asarray(hdul[0].data, dtype=np.uint16), hdul[0].header
+
+        data, header = await asyncio.to_thread(read)
+        logger.debug(f"read TheSky frame {path}")
+
+        date_obs = datetime.fromisoformat(header["DATE-OBS"]).replace(tzinfo=UTC)
+        temp = _float_or_none(header.get("CCD-TEMP"))
+        return data, date_obs, temp, float(header.get("XBINNING", 1)), float(header.get("YBINNING", 1))
+
     def _pixels_from_csv_block(self, csv_block: str, dtype: str = "uint16") -> list[array.array]:
         """
         Convert a single CSV block string like:
@@ -334,20 +392,28 @@ class TheSkyCamera(TheSkyDevice):
         return img
 
     async def status_publish(self):
+        if self._capturing:
+            return
+
         try:
             resp = await self.execute(
                 """
                 var Out;
-                Out = [
-                    ccdsoftCamera.Status,
-                    ccdsoftCamera.Temperature,
-                    ccdsoftCamera.SubframeLeft,
-                    ccdsoftCamera.SubframeTop,
-                    ccdsoftCamera.SubframeRight,
-                    ccdsoftCamera.SubframeBottom,
-                    ccdsoftCamera.BinX,
-                    ccdsoftCamera.BinY
-                ];
+                // Reading a disconnected camera throws, which would park TheSky in its debugger.
+                if (ccdsoftCamera.Status == "Not Connected") {
+                    Out = ["Not Connected"];
+                } else {
+                    Out = [
+                        ccdsoftCamera.Status,
+                        ccdsoftCamera.Temperature,
+                        ccdsoftCamera.SubframeLeft,
+                        ccdsoftCamera.SubframeTop,
+                        ccdsoftCamera.SubframeRight,
+                        ccdsoftCamera.SubframeBottom,
+                        ccdsoftCamera.BinX,
+                        ccdsoftCamera.BinY
+                    ];
+                }
                 """
             )
         except ProcessAbortedError:
@@ -355,19 +421,25 @@ class TheSkyCamera(TheSkyDevice):
             return
 
         parts = resp.split(",")
-        temp, left, top, right, bottom, binx, biny = map(float, parts[1:])
-
         connected = parts[0] != "Not Connected"
         self.device_connected = connected
+
+        device = sk.device()
+        if not connected:
+            await device.publish(Connected(is_connected=False))
+            return
+
+        temp = _float_or_none(parts[1])
+        left, top, right, bottom, binx, biny = map(float, parts[2:])
 
         width = int(right - left)
         height = int(bottom - top)
 
-        device = sk.device()
         await device.publish(Connected(is_connected=connected))
-        await device.publish(
-            CameraSensorTemperature(temperature=temp, units=TemperatureUnit.CELSIUS)
-        )
+        if temp is not None:
+            await device.publish(
+                CameraSensorTemperature(temperature=temp, units=TemperatureUnit.CELSIUS)
+            )
         await device.publish(CameraSensorSize(x=width, y=height))
         await device.publish(Binning(x=int(binx), y=int(biny)))
 
@@ -376,13 +448,31 @@ class TheSkyCameraConfig(TheSkyDeviceConfig[TheSkyCamera]):
     """TheSky Camera configuration."""
 
     device_type: Literal["camera"] = "camera"
-    temperature: float = -10.0
+    temperature: float | None = -10.0  # C; None leaves the cooler alone
+    # How frames get back from TheSky: "scanline" streams them through the script server;
+    # "file" has TheSky auto-save each frame and reads that FITS (needs a shared filesystem).
+    readout: Literal["scanline", "file"] = "scanline"
+    bayer: BayerPattern | None = None  # raw color sensor's CFA pattern in scanLine row order
     status_frequency: float = 1.0
     timeout: float
 
     @override
     def create_device(self):
         return TheSkyCamera(self)
+
+
+def _image_file_name(value) -> str | None:
+    """TheSky's LastImageFileName, or None when it reports no file."""
+    name = str(value).strip() if value is not None else ""
+    return None if name in ("", "undefined", "null") else name
+
+
+def _float_or_none(value) -> float | None:
+    """A numeric TheSky reading, or None where it has none (e.g. a DSLR's sensor temperature)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class TheSkyCameraState(TheSkyDeviceState):

@@ -53,6 +53,19 @@ async def test_set_temperature(camera):
 
 
 @pytest.mark.asyncio
+async def test_initialize_without_cooler(simulator):
+    """A camera configured without a temperature (e.g. a DSLR) never touches the cooler."""
+    host, port = simulator
+    camera = TheSkyCameraConfig(
+        host=host, port=port, temperature=None, timeout=5.0, status_frequency=0.1
+    ).create_device()
+    await camera._initialize()
+    assert camera.device_connected is True
+    resp = await camera.execute("ccdsoftCamera.RegulateTemperature;")
+    assert int(resp) == 0
+
+
+@pytest.mark.asyncio
 async def test_set_binning(camera):
     await camera.camera_connect(Connect())
     await camera.camera_set_binning(
