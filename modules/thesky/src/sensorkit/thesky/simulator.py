@@ -50,9 +50,16 @@ def read_template():
 
 def run_thesky_script(script: bytes, state: SimulationState | None = None):
     pre, post = read_template()
+
+    # TheSky responds with the script's completion value. Capture it the same way (eval yields
+    # it), unless the script set Out itself.
+    body = (
+        b"var __completion = eval(" + json.dumps(script.decode()).encode() + b");\n"
+        b"if (Out === null) { Out = __completion; }"
+    )
     return cast(
         Simulation,
-        dukpy.evaljs(pre + script + post, State=state)
+        dukpy.evaljs(pre + body + post, State=state)
     )
 
 

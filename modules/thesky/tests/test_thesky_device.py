@@ -5,14 +5,17 @@ from asyncio import StreamReader, StreamWriter
 import pytest
 
 from sensorkit.thesky.device import (
+    SCRIPT_ERROR_MARKER,
     SCRIPT_FOOTER,
     SCRIPT_HEADER,
     CommandNotSupportedError,
     ProcessAbortedError,
+    ScriptError,
     TheSkyDevice,
     TheSkyDeviceConfig,
     TheSkyError,
     parse_thesky_response,
+    raise_script_error,
     send_thesky_script,
 )
 
@@ -113,3 +116,40 @@ def test_thesky_device():
     device = cfg.create_device()
     assert isinstance(device, TheSkyDevice)
     assert device.config is cfg
+
+
+def test_caught_script_errors_keep_their_code():
+    # TheSky's own failures name their code, so the typed errors callers retry on still apply.
+    with pytest.raises(ProcessAbortedError) as e:
+        raise_script_error(f"{SCRIPT_ERROR_MARKER}TypeError: Process aborted. Error = 212.")
+    assert e.value.code == 212
+    assert e.value.args[0] == "Process aborted"
+
+    # Anything without a code (a script bug, a missing plugin object) is a ScriptError.
+    with pytest.raises(ScriptError) as e:
+        raise_script_error(f"{SCRIPT_ERROR_MARKER}ReferenceError: Can't find variable: Raven3")
+    assert e.value.args[0] == "ReferenceError: Can't find variable: Raven3"
+
+    # Ordinary values pass through.
+    assert raise_script_error("Ready") is None
+
+    # The same failure as TheSky returns it from a wrapped script: value, then the trailer.
+    no_error = "No error. Error = 0."
+    with pytest.raises(TheSkyError) as e:
+        parse_thesky_response(
+            f"{SCRIPT_ERROR_MARKER}TypeError: No connection to the device. Error = 215.|{no_error}".encode()
+        )
+    assert e.value.code == 215
+    assert e.value.args[0] == "No connection to the device"
+
+
+@pytest.mark.asyncio
+async def test_a_throwing_script_raises_instead_of_escaping(simulator):
+    host, port = simulator
+    device = TheSkyDeviceConfig(device_type=None, host=host, port=port, timeout=5.0).create_device()
+
+    with pytest.raises(ScriptError):
+        await device.execute("NoSuchObject.property;")
+
+    # The wrapper leaves a script's value alone.
+    assert await device.execute("var Out; Out = [1, 2];") == "1,2"

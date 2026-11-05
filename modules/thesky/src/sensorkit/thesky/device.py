@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import re
 from collections.abc import Callable, Coroutine
 from typing import ClassVar, Literal
 
@@ -11,6 +13,22 @@ from pydantic import BaseModel
 
 SCRIPT_HEADER = b"/* Java Script */\n/* Socket Start Packet */\n"
 SCRIPT_FOOTER = b"\n/* Socket End Packet */"
+
+# Marks a script exception caught by `wrap_script`, so the host can raise it.
+SCRIPT_ERROR_MARKER = "SensorKit script error: "
+
+
+def wrap_script(script: str) -> str:
+    """Wrap *script* so an exception comes back as a value instead of escaping.
+
+    An uncaught exception opens TheSky's script debugger, which then blocks the script server
+    for every client until someone presses Continue. Caught, it returns as an ordinary response:
+    TheSky responds with the script's completion value, which the `try` passes through.
+
+    The script must stay inline. Run through `eval`, TheSky's debugger counts an exception as
+    uncaught in the eval'd code and stops on it despite the surrounding `try`.
+    """
+    return f"try {{\n{script}\n}} catch (e) {{\nOut = {json.dumps(SCRIPT_ERROR_MARKER)} + e;\n}}"
 
 # Sentinel for `execute(timeout=...)`, distinguishing "use the device's configured
 # timeout" (the default) from an explicit None, which means do not bound the call.
@@ -78,14 +96,29 @@ def parse_thesky_response(response: bytes):
                 else:
                     raise TheSkyError(message=left[sep + 1 :].decode(errors="ignore"), code=code)
         case (left, middle, _):
+            # A TheSky error with its code: uncaught, or caught by `wrap_script` and returned.
             sep = middle.find(b"|")
             code = int(float(middle[:sep]))
-            raise TheSkyError(
-                message=left.removeprefix(b"TypeError: ").decode(errors="ignore"),
-                code=code,
-            )
+            message = left.removeprefix(SCRIPT_ERROR_MARKER.encode()).removeprefix(b"TypeError: ")
+            raise TheSkyError(message=message.decode(errors="ignore"), code=code)
 
     raise TheSkyError(message="Could not parse response", code=-1)
+
+
+def raise_script_error(value: str):
+    """Raise the TheSkyError a caught script exception stands for, if *value* is one.
+
+    TheSky's own failures carry their code in the message (e.g. "... Error = 121."), which
+    keeps busy/unsupported handling intact; anything else (a script bug, a missing plugin
+    object) raises ScriptError.
+    """
+    if not value.startswith(SCRIPT_ERROR_MARKER):
+        return
+
+    message = value.removeprefix(SCRIPT_ERROR_MARKER).removeprefix("TypeError: ")
+    if match := re.search(r"\s*Error = (-?\d+)\.?\s*$", message):
+        raise TheSkyError(message=message[: match.start()].rstrip(" ."), code=int(match.group(1)))
+    raise TheSkyError(message=message, code=ScriptError.code)
 
 
 class TheSkyDevice:
@@ -124,10 +157,12 @@ class TheSkyDevice:
             response = await send_thesky_script(
                 self.config.host,
                 self.config.port,
-                script.encode(),
+                wrap_script(script).encode(),
                 timeout=self.config.timeout if timeout is _CONFIG_TIMEOUT else timeout,
             )
-            return parse_thesky_response(response)
+            value = parse_thesky_response(response)
+            raise_script_error(value)
+            return value
 
     async def poll(self, script: str, expected: str, delay: float = 0.1, interval: float = 1.0):
         """Poll a script until it returns the expected value.
@@ -192,6 +227,12 @@ class DeviceConnectionError(TheSkyError):
 
 class ScriptBusyError(TheSkyError):
     code = 0
+
+
+class ScriptError(TheSkyError):
+    """A script raised an exception TheSky gave no error code for."""
+
+    code = -2
 
 
 class FilterWheelCommandInProgressError(TheSkyError):
