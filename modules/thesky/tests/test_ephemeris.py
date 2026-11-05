@@ -76,3 +76,31 @@ async def test_telescope_follow_ephemeris(telescope):
     dec_rate = float(await telescope.execute("sky6RASCOMTele.dDecTrackingRate;"))
     assert ra_rate == pytest.approx(36.0, rel=1e-3)
     assert dec_rate == pytest.approx(18.0, rel=1e-3)
+
+
+@pytest.mark.asyncio
+async def test_telescope_follow_tle_without_raven3(telescope):
+    """Without Raven3, a TLE target follows as an ephemeris snapshot and never touches Raven3."""
+    from sensorkit.astro.common import TLE
+    from sensorkit.astro.target import TLETarget
+
+    telescope._has_raven3 = False
+    # Poison Raven3 so any reference fails the test, as it would stall a real TheSky.
+    await telescope.execute("Raven3 = null;")
+
+    target = TLETarget(
+        tle=TLE(
+            line0="0 ISS (ZARYA)",
+            line1="1 25544U 98067A   24100.50000000  .00016717  00000-0  10270-3 0  9002",
+            line2="2 25544  51.6400 200.0000 0001234  90.0000 270.0000 15.49000000400000",
+        )
+    )
+
+    await telescope.telescope_connect(Connect())
+    await telescope.telescope_unpark()
+    await telescope.telescope_follow_target(FollowTarget(target=target))
+
+    assert (await telescope.execute("sky6RASCOMTele.IsTracking;")).strip() == "1"
+    ra_rate = float(await telescope.execute("sky6RASCOMTele.dRaTrackingRate;"))
+    dec_rate = float(await telescope.execute("sky6RASCOMTele.dDecTrackingRate;"))
+    assert abs(ra_rate) + abs(dec_rate) > 0

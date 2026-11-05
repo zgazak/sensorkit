@@ -132,6 +132,11 @@ class TheSkyTelescope(TheSkyDevice):
     _geodetic: Geodetic | None = None
     _location: EarthLocation | None = None
 
+    # Whether TheSky has the Raven3 satellite-tracking plugin, probed in entity_init.
+    # Without it, any reference to Raven3 throws, which parks TheSky's script server
+    # in its debugger, so TLE targets fall back to an ephemeris and rate follow.
+    _has_raven3: bool = True
+
     # NOTE: For a TheSky telescope, you have to home it before any commands at all, and you have to "Unpark" it
     # (if in the "Park" position) before any motion. If you "Park" the telescope and "Disconnect" it, note that
     # it will not be in the software "Park" position upon a reconnection, even if it is actually in the hardware
@@ -196,6 +201,10 @@ class TheSkyTelescope(TheSkyDevice):
             f"site info: lat={self._site_lat}, lon={self._site_lon}, "
             f"height={self._site_elev} m"
         )
+
+        self._has_raven3 = (await self.execute("""typeof Raven3;""")).strip() != "undefined"
+        if not self._has_raven3:
+            logger.warning("TheSky has no Raven3 plugin; TLE targets will follow a constant-rate ephemeris")
 
     @sk.on_detach
     async def entity_deinit(self):
@@ -398,7 +407,7 @@ class TheSkyTelescope(TheSkyDevice):
             AltAzTarget,
             (FrameTarget, ReferenceFrame.ICRF),
             (FrameTarget, ReferenceFrame.ALTAZ),
-            TLETarget,
+            *([TLETarget] if self._has_raven3 else []),
             (RateTarget, ReferenceFrame.ICRF),
             (EphemerisTarget, ReferenceFrame.ICRF),
             observer=self._geodetic,
@@ -745,6 +754,9 @@ class TheSkyTelescope(TheSkyDevice):
         Returns True if a track was active and aborted, False if none was
         running (or the mount doesn't implement Raven3).
         """
+        if not self._has_raven3:
+            return False
+
         try:
             status = (await self.execute("""Raven3.trackLEOStatus;""")).strip()
         except CommandNotSupportedError:
@@ -818,20 +830,25 @@ class TheSkyTelescope(TheSkyDevice):
                 var SlewComplete = -1;
                 try { SlewComplete = sky6RASCOMTele.IsSlewComplete; } catch (e) {}
                 var Out;
-                sky6RASCOMTele.GetRaDec();
-                sky6RASCOMTele.GetAzAlt();
-                Out = [
-                    sky6RASCOMTele.IsConnected,
-                    sky6RASCOMTele.dRa,
-                    sky6RASCOMTele.dRaTrackingRate,
-                    sky6RASCOMTele.dDec,
-                    sky6RASCOMTele.dDecTrackingRate,
-                    sky6RASCOMTele.dAlt,
-                    sky6RASCOMTele.dAz,
-                    SlewComplete,
-                    sky6RASCOMTele.IsTracking,
-                    LeoStatus
-                ];
+                // GetRaDec throws on a disconnected mount, which would park TheSky in its debugger.
+                if (sky6RASCOMTele.IsConnected) {
+                    sky6RASCOMTele.GetRaDec();
+                    sky6RASCOMTele.GetAzAlt();
+                    Out = [
+                        sky6RASCOMTele.IsConnected,
+                        sky6RASCOMTele.dRa,
+                        sky6RASCOMTele.dRaTrackingRate,
+                        sky6RASCOMTele.dDec,
+                        sky6RASCOMTele.dDecTrackingRate,
+                        sky6RASCOMTele.dAlt,
+                        sky6RASCOMTele.dAz,
+                        SlewComplete,
+                        sky6RASCOMTele.IsTracking,
+                        LeoStatus
+                    ];
+                } else {
+                    Out = [0, 0, 0, 0, 0, 0, 0, -1, 0, -1];
+                }
                 """
             )
         except ProcessAbortedError:
@@ -853,6 +870,10 @@ class TheSkyTelescope(TheSkyDevice):
 
         connected = bool(connected)
         self.device_connected = connected
+
+        if not connected:
+            await sk.device().publish(Connected(is_connected=False))
+            return
 
         leo_status = int(leo_status)
         if leo_status in (LEO_SLEWING, LEO_SETTLING):
