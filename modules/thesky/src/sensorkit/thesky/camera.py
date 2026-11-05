@@ -316,23 +316,36 @@ class TheSkyCamera(TheSkyDevice):
         logger.debug("completed camera capture")
 
     async def _read_scanlines(self):
-        """Pull the active image through TheSky's script server, one CSV scan line at a time."""
-        resp = await self.execute(
-            """
-            ccdsoftCameraImage.AttachToActiveImager();
-            var H = ccdsoftCameraImage.HeightInPixels;
-            var Out = "";
-            for (var y = 0; y < H; y++) {
-                if (y > 0) Out += ";";
-                Out += ccdsoftCameraImage.scanLine(y);
-            }
-            """
+        """Pull the active image through TheSky's script server as CSV scan lines.
+
+        Rows come back `scanline_chunk_rows` per script. Building a whole large frame as one
+        string (~90 MB for 18 MP) inside TheSky has left it unresponsive for tens of seconds.
+        """
+        height = int(
+            await self.execute(
+                """
+                ccdsoftCameraImage.AttachToActiveImager();
+                ccdsoftCameraImage.HeightInPixels;
+                """
+            )
         )
 
-        # Convert it to list[array.array] - this is CPU-bound, so background it
-        data: list[array.array] = await asyncio.to_thread(
-            self._pixels_from_csv_block, resp, "uint16"
-        )
+        data: list[array.array] = []
+        for start in range(0, height, self.config.scanline_chunk_rows):
+            end = min(start + self.config.scanline_chunk_rows, height)
+            resp = await self.execute(
+                f"""
+                ccdsoftCameraImage.AttachToActiveImager();
+                var Out = "";
+                for (var y = {start}; y < {end}; y++) {{
+                    if (y > {start}) Out += ";";
+                    Out += ccdsoftCameraImage.scanLine(y);
+                }}
+                """
+            )
+
+            # Convert it to list[array.array] - this is CPU-bound, so background it
+            data += await asyncio.to_thread(self._pixels_from_csv_block, resp, "uint16")
 
         resp = await self.execute(
             """
@@ -452,6 +465,7 @@ class TheSkyCameraConfig(TheSkyDeviceConfig[TheSkyCamera]):
     # How frames get back from TheSky: "scanline" streams them through the script server;
     # "file" has TheSky auto-save each frame and reads that FITS (needs a shared filesystem).
     readout: Literal["scanline", "file"] = "scanline"
+    scanline_chunk_rows: int = 128  # rows per script in scanline readout
     bayer: BayerPattern | None = None  # raw color sensor's CFA pattern in scanLine row order
     status_frequency: float = 1.0
     timeout: float

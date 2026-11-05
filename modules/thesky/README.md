@@ -79,7 +79,7 @@ value:
         mount1:
           device_type: telescope
           status_frequency_slow: 1.0     # poll interval while idle/tracking (seconds)
-          status_frequency_fast: 0.1     # poll interval during tracking (seconds)
+          status_frequency_fast: 1.0     # poll interval during tracking (seconds)
         rotator1:
           device_type: rotator
         focuser1:

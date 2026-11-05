@@ -922,7 +922,8 @@ class TheSkyTelescopeConfig(TheSkyDeviceConfig[TheSkyTelescope]):
 
     device_type: Literal["telescope"] = "telescope"
     status_frequency_slow: float = 1.0
-    status_frequency_fast: float = 0.1
+    # Every status poll is a script on a new TCP connection; much faster has hung TheSky.
+    status_frequency_fast: float = 1.0
     timeout: float = 300.0
     require_coupled_dome: bool = False
 
