@@ -20,6 +20,7 @@ from sensorkit.common.aio import AsyncLoop
 from sensorkit.std import Connect, Disconnect, FollowTarget, Home, MoveToPark, Slewing, Stop
 from sensorkit.thesky.device import (
     CommandNotSupportedError,
+    MountNotHomedError,
     TheSkyError,
 )
 from sensorkit.thesky.telescope import TheSkyTelescopeConfig, TheSkyTelescopeState
@@ -402,3 +403,45 @@ async def test_dome_wait_timeout(telescope, require_coupled_dome):
         )
 
     assert telescope.fast_loop.active
+
+
+@pytest.fixture
+def unhomed_telescope(telescope):
+    """A mount that refuses slews and parks (TheSky error 231) until FindHome runs, while
+    its saved state still claims it was homed (e.g. after a power cycle)."""
+    homed = False
+    real_execute = telescope.execute
+
+    async def execute(script):
+        nonlocal homed
+        if "FindHome" in script:
+            homed = True
+        elif not homed and ("SlewTo" in script or "ParkAndDoNotDisconnect" in script):
+            raise MountNotHomedError(
+                message="The operation failed because the mount is not yet homed", code=231
+            )
+        return await real_execute(script)
+
+    telescope.execute = execute
+    telescope.state.has_been_homed = True
+    return telescope
+
+
+@pytest.mark.asyncio
+async def test_follow_homes_an_unhomed_mount_and_retries(unhomed_telescope):
+    await unhomed_telescope.telescope_connect(Connect())
+    target = AltAzTarget(coords=Horizontal(az=0.0, alt=75.0))
+
+    await unhomed_telescope.telescope_follow_target(FollowTarget(target=target))
+
+    assert unhomed_telescope.state.has_been_homed
+    assert float(await unhomed_telescope.execute("sky6RASCOMTele.dAlt;")) == pytest.approx(75.0)
+
+
+@pytest.mark.asyncio
+async def test_park_homes_an_unhomed_mount_and_retries(unhomed_telescope):
+    await unhomed_telescope.telescope_connect(Connect())
+
+    await unhomed_telescope.telescope_park(MoveToPark())
+
+    assert (await unhomed_telescope.execute("sky6RASCOMTele.IsParked();")).strip() == "true"

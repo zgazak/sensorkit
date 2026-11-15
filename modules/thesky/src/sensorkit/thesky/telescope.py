@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Literal, override
 
@@ -49,6 +50,7 @@ from sensorkit.thesky.device import (
     CommandNotSupportedError,
     DomeCommandInProgressError,
     MountCommandInProgressError,
+    MountNotHomedError,
     ProcessAbortedError,
     ScriptBusyError,
     TheSkyDevice,
@@ -305,19 +307,21 @@ class TheSkyTelescope(TheSkyDevice):
         await self.fast_loop.stop()
         await self.require_connected()
         logger.debug("parking telescope")
-
-        async with asyncio.timeout(self.config.timeout):
-            while True:
-                try:
-                    await self.execute("""sky6RASCOMTele.ParkAndDoNotDisconnect();""")
-                    break
-                except (MountCommandInProgressError, ScriptBusyError):
-                    await asyncio.sleep(0.5)
+        await self._homed_retry(self._start_park)
 
         async with asyncio.timeout(self.config.timeout):
             await self.poll("""sky6RASCOMTele.IsParked();""", "true")
 
         logger.debug("parked telescope")
+
+    async def _start_park(self):
+        async with asyncio.timeout(self.config.timeout):
+            while True:
+                try:
+                    await self.execute("""sky6RASCOMTele.ParkAndDoNotDisconnect();""")
+                    return
+                except (MountCommandInProgressError, ScriptBusyError):
+                    await asyncio.sleep(0.5)
 
     @sk.command_handler
     async def telescope_set_park_position(self, cmd: SetParkPosition):
@@ -394,8 +398,26 @@ class TheSkyTelescope(TheSkyDevice):
 
         logger.debug("homed telescope")
 
+    async def _homed_retry(self, action: Callable[[], Coroutine]):
+        """Run *action*, homing the mount and retrying once if TheSky says it isn't homed.
+
+        TheSky exposes no scripting property for the homed state, and `has_been_homed` only
+        records that this driver homed the mount once: after the mount loses power or its
+        home reference, TheSky refuses slews and parks until it is homed again.
+        """
+        try:
+            return await action()
+        except MountNotHomedError:
+            logger.warning("mount is not homed; homing before retrying")
+            self.state.has_been_homed = False
+            await self.telescope_home(Home())
+            return await action()
+
     @sk.command_handler
     async def telescope_follow_target(self, cmd: FollowTarget):
+        await self._homed_retry(lambda: self._follow_target(cmd))
+
+    async def _follow_target(self, cmd: FollowTarget):
         await self.fast_loop.stop()
         await self.telescope_unpark()
 

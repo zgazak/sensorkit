@@ -283,6 +283,10 @@ class CommandNotSupportedError(TheSkyError):
     code = 228
 
 
+class MountNotHomedError(TheSkyError):
+    code = 231
+
+
 class ObjectNotFoundError(TheSkyError):
     code = 250
 
